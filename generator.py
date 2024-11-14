@@ -3,14 +3,35 @@
 import filecmp
 import time
 import os
+import io
 import tarfile
+import bsdiff4
 import argparse
+import pyrsync
+import tqdm
 
 
+def get_file_diff_rsync(old_file,new_file) -> bytes:
+    old = open(old_file,'rb')
+    new = open(new_file,'rb')
+    magic, block_len, strong_len = pyrsync.get_signature_args(os.path.getsize(old_file))
+    sig = io.BytesIO()
+    pyrsync.signature(new, sig, strong_len, magic, block_len)
+    new.seek(0, 0)
+    sig.seek(0, 0)
+    actual_delta = io.BytesIO()
+    pyrsync.delta(old, sig, actual_delta)
+    old.close()
+    new.close()
+    return actual_delta.getbuffer().tobytes()
+
+def get_file_diff_bsdiff4(old_file,new_file) -> bytes:
+    old = open(old_file, 'rb').read()
+    new = open(new_file, 'rb').read()
+    return bsdiff4.diff(old, new)
 
 
-
-def get_diff_files(dirs,diff_files,deleted,added):
+def get_folder_diff(dirs, diff_files: list, deleted: list, added: list) -> None:
     for file_root in dirs.diff_files:
         diff_files.append(os.path.join(dirs.right, file_root))
     for file_left in dirs.left_only: ## only in old version == deleted
@@ -23,7 +44,7 @@ def get_diff_files(dirs,diff_files,deleted,added):
                 for file in files:
                     added.append(os.path.join(root,file))
     for sub_dirs in dirs.subdirs.values():
-        get_diff_files(sub_dirs,diff_files,deleted,added)
+        get_folder_diff(sub_dirs, diff_files, deleted, added)
 
 
 def get_header(old_dir: str, new_dir: str) -> tuple:
@@ -31,7 +52,7 @@ def get_header(old_dir: str, new_dir: str) -> tuple:
     changed_files = [] # note that these are all absolute paths; when stored they need to be relative.
     deleted_files = []
     added_files = []
-    get_diff_files(dirs_comp,changed_files,deleted_files,added_files)
+    get_folder_diff(dirs_comp, changed_files, deleted_files, added_files)
     return changed_files,added_files,deleted_files
 
 if __name__ == "__main__":
@@ -39,49 +60,50 @@ if __name__ == "__main__":
     parser.add_argument('--old', required=True, help="Path to the old directory.")
     parser.add_argument('--new', required=True, help="Path to the new directory")
     parser.add_argument('--dest', required=True, help="Path to the location of the patches.")
+    parser.add_argument('--algo',choices=['bsdiff','none'],default='bsdiff', help="Choice of patching algorithm.")
     args = parser.parse_args()
     old_path = os.path.abspath(args.old)
     new_path = os.path.abspath(args.new)
     start_time = time.process_time()
+    print("Diffing folders (this may take a while...)")
     changed,added,deleted = get_header(old_path,new_path) # note: paths are absolute.
-    f = open("beans.txt",'w+')
-    f.write(str(added))
-    f.write(str(changed))
-    f.write(str(deleted))
-    f.close()
     tar = tarfile.open(args.dest,'w|gz',compresslevel=3)
-    for changed_file in changed:
-        rel_path = os.path.relpath(changed_file, start=new_path)
-        print(f"C | {rel_path}")
+    print("Adding changed files...")
+    for changed_file_path in tqdm.tqdm(changed):
+        rel_path = os.path.relpath(changed_file_path, start=new_path)
         info = tarfile.TarInfo(rel_path)
-        info.pax_headers = {"T":"C"}
-        info.mode = os.stat(changed_file).st_mode
-        info.size = os.path.getsize(changed_file)
-        tar.addfile(info,open(changed_file,'rb'))
-
-    for added_file in added:
-        rel_path = os.path.relpath(added_file, start=new_path) # we need the relative path to store the file name inside the tar properly.
-        print(f"A | {rel_path}")
+        info.mode = os.stat(changed_file_path).st_mode
+        if os.path.getsize(changed_file_path) > 10000000 and args.algo != "none": # 10M
+            info.pax_headers = {"T":"B"}
+            diff = get_file_diff_bsdiff4(os.path.join(old_path, rel_path),changed_file_path) # os.path.join converts the relpath to the old path.
+            info.size = len(diff)
+            tar.addfile(info, io.BytesIO(initial_bytes=diff))
+        else:
+            info.pax_headers = {"T": "C"}
+            info.size = os.path.getsize(changed_file_path)
+            tar.addfile(info, open(changed_file_path, 'rb'))
+    print("Adding new files...")
+    for added_file_path in tqdm.tqdm(added):
+        rel_path = os.path.relpath(added_file_path, start=new_path) # we need the relative path to store the file name inside the tar properly.
         info = tarfile.TarInfo(rel_path)
+        info.mode = os.stat(added_file_path).st_mode
         info.pax_headers = {"T":"A"}
-        info.mode = os.stat(added_file).st_mode
-        if os.path.isdir(added_file): # added may include directories, so handling it here.
+        if os.path.isdir(added_file_path): # added may include directories, so handling it here.
             info.type = tarfile.DIRTYPE
             tar.addfile(info)
         else:
-            info.size = os.path.getsize(added_file)
-            tar.addfile(info,open(added_file,'rb'))
-
-    for deleted_file in deleted:
-        rel_path = os.path.relpath(deleted_file, start=old_path)
-        print(f"D | {rel_path}")
+            info.size = os.path.getsize(added_file_path)
+            tar.addfile(info, open(added_file_path, 'rb'))
+    print("Adding ...deleted files...")
+    for deleted_file_path in tqdm.tqdm(deleted):
+        rel_path = os.path.relpath(deleted_file_path, start=old_path)
         info = tarfile.TarInfo(rel_path)
         info.pax_headers = {"T":"D"}
         tar.addfile(info)
 
     tar.close()
     end_time = time.process_time()
-    print(f"Patch generated!\nTime:{(end_time-start_time)*10:.2f}s\nSize:{os.path.getsize(args.dest)>>20} MB")
+    print(f"Patch generated!\nTime:{(end_time-start_time):.2f}s\nSize:{os.path.getsize(args.dest)>>20} MB")
     print(f"{len(changed)} modified files\n{len(added)} added files\n{len(deleted)} deleted files")
 
 
