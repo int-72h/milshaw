@@ -7,23 +7,16 @@ import io
 import tarfile
 import bsdiff4
 import argparse
-import pyrsync
 import tqdm
+import detools.create
 
 
-def get_file_diff_rsync(old_file,new_file) -> bytes:
+def get_file_diff_match_blocks(old_file,new_file) -> bytes:
     old = open(old_file,'rb')
     new = open(new_file,'rb')
-    magic, block_len, strong_len = pyrsync.get_signature_args(os.path.getsize(old_file))
-    sig = io.BytesIO()
-    pyrsync.signature(new, sig, strong_len, magic, block_len)
-    new.seek(0, 0)
-    sig.seek(0, 0)
-    actual_delta = io.BytesIO()
-    pyrsync.delta(old, sig, actual_delta)
-    old.close()
-    new.close()
-    return actual_delta.getbuffer().tobytes()
+    patch = io.BytesIO()
+    detools.create.create_patch(old,new,patch,compression='none',algorithm='match-blocks',patch_type='hdiffpatch')
+    return patch.getbuffer().tobytes()
 
 def get_file_diff_bsdiff4(old_file,new_file) -> bytes:
     old = open(old_file, 'rb').read()
@@ -60,7 +53,7 @@ if __name__ == "__main__":
     parser.add_argument('--old', required=True, help="Path to the old directory.")
     parser.add_argument('--new', required=True, help="Path to the new directory")
     parser.add_argument('--dest', required=True, help="Path to the location of the patches.")
-    parser.add_argument('--algo',choices=['bsdiff','none'],default='bsdiff', help="Choice of patching algorithm.")
+    parser.add_argument('--algo',choices=['bsdiff','none','match-blocks'],default='match-blocks', help="Choice of patching algorithm.")
     args = parser.parse_args()
     old_path = os.path.abspath(args.old)
     new_path = os.path.abspath(args.new)
@@ -73,9 +66,14 @@ if __name__ == "__main__":
         rel_path = os.path.relpath(changed_file_path, start=new_path)
         info = tarfile.TarInfo(rel_path)
         info.mode = os.stat(changed_file_path).st_mode
-        if os.path.getsize(changed_file_path) > 10000000 and args.algo != "none": # 10M
-            info.pax_headers = {"T":"B"}
-            diff = get_file_diff_bsdiff4(os.path.join(old_path, rel_path),changed_file_path) # os.path.join converts the relpath to the old path.
+        if os.path.getsize(changed_file_path) > 1 and args.algo != "none": # 100K
+            if args.algo == "bsdiff":
+                info.pax_headers = {"T":"B"}
+                diff = get_file_diff_bsdiff4(os.path.join(old_path, rel_path),changed_file_path) # os.path.join converts the relpath to the old path.
+            elif args.algo == "match-blocks":
+                info.pax_headers = {"T":"M"}
+                diff = get_file_diff_match_blocks(os.path.join(old_path, rel_path),changed_file_path) # os.path.join converts the relpath to the old
+                # path.
             info.size = len(diff)
             tar.addfile(info, io.BytesIO(initial_bytes=diff))
         else:
@@ -105,7 +103,3 @@ if __name__ == "__main__":
     end_time = time.process_time()
     print(f"Patch generated!\nTime:{(end_time-start_time):.2f}s\nSize:{os.path.getsize(args.dest)>>20} MB")
     print(f"{len(changed)} modified files\n{len(added)} added files\n{len(deleted)} deleted files")
-
-
-
-
