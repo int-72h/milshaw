@@ -4,17 +4,7 @@ import tarfile
 import shutil
 import io
 import tqdm
-import bsdiff4
 import detools
-
-
-def patch_file_bsdiff(old_file: str, patch: bytes) -> None:
-    old = open(old_file, 'rb').read()
-    new = bsdiff4.patch(old, patch)
-    old = open(old_file, 'wb')
-    old.write(new)
-    old.close()
-
 
 def patch_file_match_blocks(old_file, patch) -> None:
     old = open(old_file, 'rb')
@@ -34,19 +24,20 @@ if __name__ == "__main__":
     patch_path = os.path.abspath(args.patch)
     tar = tarfile.open(patch_path)
     for tarinfo in tqdm.tqdm(tar):
-        file_type = tarinfo.pax_headers["T"]
+        unsafe_abs_path = os.path.join(target_path, tarinfo.name)
+        tarinfo = tarfile.data_filter(tarinfo,unsafe_abs_path)
         abs_path = os.path.join(target_path, tarinfo.name)
+        file_type = tarinfo.pax_headers["T"]
         match file_type:
             case "M":
                 patch = tar.extractfile(tarinfo.name)
                 patch_file_match_blocks(abs_path, patch)
-            case "B":
-                patch = tar.extractfile(tarinfo.name).read()
-                patch_file_bsdiff(abs_path, patch)
-            case "A" | "C":
+            case "A":
                 tar.extract(tarinfo, target_path)
             case "D":
                 if os.path.isdir(abs_path):
-                    shutil.rmtree(abs_path)  # must be very careful here.
+                    shutil.rmtree(abs_path)
                 else:
                     os.remove(abs_path)
+            case _:
+                print(f"Unknown file header {file_type} detected. Ignoring.")
