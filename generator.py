@@ -3,6 +3,7 @@
 ### Optionally stores patches instead of the whole file.
 ### Stores the file type (full file, patch, delete) in the PAX header per file.
 
+from filecmp import dircmp
 import filecmp
 import time
 import os
@@ -13,7 +14,7 @@ import tqdm
 import detools.create
 
 
-def get_file_diff_match_blocks(old_file, new_file) -> bytes:
+def get_file_diff_match_blocks(old_file: str, new_file: str) -> bytes:
     old = open(old_file, "rb")
     new = open(new_file, "rb")
     patch = io.BytesIO()
@@ -28,7 +29,7 @@ def get_file_diff_match_blocks(old_file, new_file) -> bytes:
     return patch.getbuffer().tobytes()
 
 
-def get_folder_diff(dirs, diff_files: list, deleted: list, added: list) -> None:
+def get_folder_diff(dirs: dircmp, diff_files: list, deleted: list, added: list) -> None:
     for file_root in dirs.diff_files:
         diff_files.append(os.path.join(dirs.right, file_root))
     for file_left in dirs.left_only:  # only in old version == deleted
@@ -44,7 +45,7 @@ def get_folder_diff(dirs, diff_files: list, deleted: list, added: list) -> None:
         get_folder_diff(sub_dirs, diff_files, deleted, added)
 
 
-def gen_patch(changed, added, deleted, path):
+def gen_patch(changed: list, added: list, deleted: list, path: str) -> None:
     tar = tarfile.open(path, "w|gz", compresslevel=3)
     print("Adding changed files...")
     for changed_file_path in tqdm.tqdm(changed):
