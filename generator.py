@@ -15,6 +15,14 @@ import detools.create
 import xxhash
 import msgpack
 import zlib
+import filecmp
+from concurrent.futures import ProcessPoolExecutor
+import cProfile
+import pstats
+
+import zstandard
+
+profiler = cProfile.Profile()
 
 def get_file_diff_match_blocks(old_file: str, new_file: str) -> bytes:
     old = open(old_file, "rb")
@@ -27,6 +35,8 @@ def get_file_diff_match_blocks(old_file: str, new_file: str) -> bytes:
         compression="none",
         algorithm="match-blocks",
         patch_type="hdiffpatch",
+        match_score=0,
+        match_block_size=10*(2**20)
     )
     return patch.getbuffer().tobytes()
 
@@ -34,9 +44,10 @@ def get_file_diff_match_blocks(old_file: str, new_file: str) -> bytes:
 def hash_file(filepath):
     hasher = xxhash.xxh64()
     with open(filepath, "rb") as f:
-        while chunk := f.read(2**20):
+        while chunk := f.read((2**20)):
             hasher.update(chunk)
     return hasher.digest()
+
 
 
 def list_files(folder):
@@ -47,44 +58,67 @@ def list_files(folder):
             files[rel_path] = os.path.join(root, filename)
     return files
 
+def p_do_diff(f):
+    return (f[0],f[1],get_file_diff_match_blocks(f[2],f[1]))
+
+def p_do_hash(f):
+    file1 = f[0]
+    file2 = f[1]
+    common_file = f[2]
+    if os.path.getsize(file1) != os.path.getsize(file2):
+        return (common_file, file2)
+    else:
+        hash1 = hash_file(file1)
+        hash2 = hash_file(file2)
+        if hash1 != hash2:
+            return(common_file, file2)
 
 def get_folder_diff(folder1, folder2):
     files_old = list_files(folder1)
     files_new = list_files(folder2)
-    changed = []
     paths_old = set(files_old.keys())
     paths_new = set(files_new.keys())
     added = [(x,files_new[x]) for x in paths_new - paths_old]
     deleted = paths_old - paths_new
-
-    for common_file in files_old.keys() & files_new.keys():
-        hash1 = hash_file(files_old[common_file])
-        hash2 = hash_file(files_new[common_file])
-        if hash1 != hash2:
-            changed.append((common_file,files_new[common_file]))
+    start_time = time.perf_counter()
+    changed = []
+    h_map = [(files_old[x],files_new[x],x) for x in files_old.keys() & files_new.keys()]
+    with ProcessPoolExecutor(max_workers=16) as executor:
+        for r in tqdm.tqdm(executor.map(p_do_hash, h_map)):
+            if r is not None:
+                changed.append(r)
+    end_time = time.perf_counter()
+    print(f"hashing took {end_time - start_time:2f}s")
     return changed, added, deleted
 
 
 def gen_patch(changed: list, added: list, deleted: list, path: str) -> None:
-    tar = tarfile.open(path, "w|gz", compresslevel=3)
+    #tf = io.BytesIO()
+    #tar = tarfile.open(mode="w",fileobj=tf)
+    to_file = open(path,"wb")
+    to_zstd = zstandard.ZstdCompressor(level=10)
+    stream = to_zstd.stream_writer(to_file)
+    tar = tarfile.open(mode="w|",fileobj=stream)
+    ###tar = tarfile.open(path,"w|gz",compresslevel=3)
     print("Adding changed files...")
-    for changed_file_paths in tqdm.tqdm(changed):
-        rel_path = changed_file_paths[0]
-        abs_path = changed_file_paths[1]
-        info = tarfile.TarInfo(rel_path)
-        info.mode = os.stat(abs_path).st_mode
-        # Only calc per-file diffs >1K. It's an expensive operation.
-        if os.path.getsize(abs_path) > 1000 and args.algo != "none":
-            info.pax_headers = {"T": "M"}
-            diff = get_file_diff_match_blocks(os.path.join(old_path, rel_path), abs_path)
-            info.size = len(diff)
-            tar.addfile(info, io.BytesIO(initial_bytes=diff))
-        else:
-            info.pax_headers = {"T": "A"}
-            info.size = os.path.getsize(abs_path)
-            tar.addfile(info, open(abs_path, "rb"))
+    if args.algo == "none":
+        added.extend(changed)
+    else:
+        to_add = [x for x in changed if os.path.getsize(x[1]) < 25*(2**20)] # slow?
+        added.extend(to_add)
+        to_diff = [(x[0],x[1],os.path.join(old_path, x[0]))
+                   for x in changed if os.path.getsize(x[1]) > 25 * (2**20)]
+        with ProcessPoolExecutor(max_workers=16) as executor:
+            for r in tqdm.tqdm(executor.map(p_do_diff,to_diff)):
+                rel_path = r[0]
+                abs_path = r[1]
+                info = tarfile.TarInfo(rel_path)
+                info.mode = os.stat(abs_path).st_mode
+                info.pax_headers = {"T": "M"}
+                info.size = len(r[2])
+                tar.addfile(info, io.BytesIO(initial_bytes=r[2]))
 
-    print("Adding new files...")
+    print("Adding new files / changed files we're not diffing...")
     for added_file_paths in tqdm.tqdm(added):
         # we need the relative path to store the file name inside the tar properly.
         rel_path = added_file_paths[0]
@@ -106,6 +140,13 @@ def gen_patch(changed: list, added: list, deleted: list, path: str) -> None:
         info.pax_headers = {"T": "D"}
         tar.addfile(info)
     tar.close()
+    #tf.seek(0)
+    #print("writing to disk...")
+    #start_time = time.perf_counter()
+    #with open(path,"wb") as f:
+    #    f.write(tf.getbuffer())
+    #end_time = time.perf_counter()
+    #print(f"disk write took {end_time-start_time:2f}s")
 
 def gen_sig(path,dest):
     hashes = {}
@@ -114,6 +155,18 @@ def gen_sig(path,dest):
         hashes[relative] = hash_file(absolute)
     with open(dest,"wb") as f:
         f.write(zlib.compress(msgpack.packb(hashes),level=9))
+
+def load_sig(path):
+    with open(path,"rb") as f:
+        hashes_undecoded = msgpack.unpack(zlib.decompress(f.read()))
+        hashes = {h[0].decode("utf-8"):h[1] for h in hashes_undecoded}
+        return hashes
+
+
+def verify(target_path,sig_path):
+    hashes = load_sig(sig_path)
+    target_files = list_files(target_path)
+    sig_files = [x[0] for x in hashes]
 
 
 if __name__ == "__main__":
@@ -125,31 +178,34 @@ if __name__ == "__main__":
     diff_parser.add_argument("dest", help="Path to the location of the patches.")
     diff_parser.add_argument(
         "--algo",
-        choices=["bsdiff", "none", "match-blocks"],
+        choices=["none", "match-blocks"],
         default="match-blocks",
         help="Choice of patching algorithm.",
     )
     sign_parser = subparser.add_parser('sign', help="Sign a folder.")
     sign_parser.add_argument('folder', help="Path to the folder to sign.")
     sign_parser.add_argument('dest', help="Destination path for the signature file.")
+    verif_parser = subparser.add_parser('verify',help="Verify and heal a folder.")
+
     args = parser.parse_args()
     if args.mode == "diff":
         old_path = os.path.abspath(args.old)
         new_path = os.path.abspath(args.new)
         dest_path = os.path.abspath(args.dest)
-        start_time = time.process_time()
+        start_time = time.perf_counter()
         print("Diffing folders (this may take a while...)")
         changed, added, deleted = get_folder_diff(old_path, new_path)
         # all paths in the 3 returned lists are absolute.
         gen_patch(changed, added, deleted, dest_path)
-        end_time = time.process_time()
+        end_time = time.perf_counter()
         print(f"Patch generated!\nTime:{(end_time-start_time):.2f}s\nSize:{os.path.getsize(dest_path)>>20} MB")
         print(f"{len(changed)} modified files\n{len(added)} added files\n{len(deleted)} deleted files")
     else:
         folder_path = os.path.abspath(args.folder)
         dest_path = os.path.abspath(args.dest)
-        start_time = time.process_time()
+        start_time = time.perf_counter()
         gen_sig(folder_path,dest_path)
-        end_time = time.process_time()
+        end_time = time.perf_counter()
         print(f"Signature generated!\nTime:{(end_time - start_time):.2f}s\nSize:{os.path.getsize(dest_path) >> 20} MB")
+
 
