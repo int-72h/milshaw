@@ -3,8 +3,6 @@
 ### Optionally stores patches instead of the whole file.
 ### Stores the file type (full file, patch, delete) in the PAX header per file.
 
-from filecmp import dircmp
-import filecmp
 import time
 import os
 import io
@@ -15,14 +13,8 @@ import detools.create
 import xxhash
 import msgpack
 import zlib
-import filecmp
 from concurrent.futures import ProcessPoolExecutor
-import cProfile
-import pstats
-
 import zstandard
-
-profiler = cProfile.Profile()
 
 def get_file_diff_match_blocks(old_file: str, new_file: str) -> bytes:
     old = open(old_file, "rb")
@@ -34,8 +26,7 @@ def get_file_diff_match_blocks(old_file: str, new_file: str) -> bytes:
         patch,
         compression="none",
         algorithm="match-blocks",
-        patch_type="hdiffpatch",
-        match_score=0,
+        patch_type="sequential",
         match_block_size=10*(2**20)
     )
     return patch.getbuffer().tobytes()
@@ -59,7 +50,7 @@ def list_files(folder):
     return files
 
 def p_do_diff(f):
-    return (f[0],f[1],get_file_diff_match_blocks(f[2],f[1]))
+    return f[0],f[1],get_file_diff_match_blocks(f[2], f[1])
 
 def p_do_hash(f):
     file1 = f[0]
@@ -93,21 +84,19 @@ def get_folder_diff(folder1, folder2):
 
 
 def gen_patch(changed: list, added: list, deleted: list, path: str) -> None:
-    #tf = io.BytesIO()
-    #tar = tarfile.open(mode="w",fileobj=tf)
     to_file = open(path,"wb")
-    to_zstd = zstandard.ZstdCompressor(level=10)
+    to_zstd = zstandard.ZstdCompressor(level=10,threads=13)
     stream = to_zstd.stream_writer(to_file)
     tar = tarfile.open(mode="w|",fileobj=stream)
-    ###tar = tarfile.open(path,"w|gz",compresslevel=3)
+    #tar = tarfile.open(path,mode="w|")
     print("Adding changed files...")
     if args.algo == "none":
         added.extend(changed)
     else:
-        to_add = [x for x in changed if os.path.getsize(x[1]) < 25*(2**20)] # slow?
+        to_add = [x for x in changed if os.path.getsize(x[1]) < 1*(2**20)] # slow?
         added.extend(to_add)
         to_diff = [(x[0],x[1],os.path.join(old_path, x[0]))
-                   for x in changed if os.path.getsize(x[1]) > 25 * (2**20)]
+                   for x in changed if os.path.getsize(x[1]) > 1* (2**20)]
         with ProcessPoolExecutor(max_workers=16) as executor:
             for r in tqdm.tqdm(executor.map(p_do_diff,to_diff)):
                 rel_path = r[0]
@@ -140,13 +129,8 @@ def gen_patch(changed: list, added: list, deleted: list, path: str) -> None:
         info.pax_headers = {"T": "D"}
         tar.addfile(info)
     tar.close()
-    #tf.seek(0)
-    #print("writing to disk...")
-    #start_time = time.perf_counter()
-    #with open(path,"wb") as f:
-    #    f.write(tf.getbuffer())
-    #end_time = time.perf_counter()
-    #print(f"disk write took {end_time-start_time:2f}s")
+    stream.close()
+    to_file.close()
 
 def gen_sig(path,dest):
     hashes = {}
@@ -170,7 +154,7 @@ def verify(target_path,sig_path):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Generate "Milshaw" patches.')
+    parser = argparse.ArgumentParser(description='Generate "sterling" patches.')
     subparser = parser.add_subparsers(dest="mode", required=True, help="Operation mode (diff or sign).")
     diff_parser = subparser.add_parser("diff", help="Calculate a diff.")
     diff_parser.add_argument("old", help="Path to the old directory.")
