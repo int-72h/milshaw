@@ -154,7 +154,7 @@ def verify(target_path,sig_path):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Generate "sterling" patches.')
+    parser = argparse.ArgumentParser(description='Generate a "sten" patch.')
     subparser = parser.add_subparsers(dest="mode", required=True, help="Operation mode (diff or sign).")
     diff_parser = subparser.add_parser("diff", help="Calculate a diff.")
     diff_parser.add_argument("old", help="Path to the old directory.")

@@ -50,7 +50,7 @@ def main(target_path: str,patch_path: str) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Apply a 'sterling' patch.")
+    parser = argparse.ArgumentParser(description="Apply a 'sten' patch.")
     parser.add_argument("target", help="Path to the old directory.")
     parser.add_argument("patch", help="Path to the location of the patches.")
     args = parser.parse_args()
